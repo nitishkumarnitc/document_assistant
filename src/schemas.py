@@ -85,28 +85,28 @@ class UserIntent(BaseModel):
     Determines which agent should handle the user's request.
     """
 
-intent_type: Literal["qa", "summarization", "calculation", "unknown"] = Field(
-    ...,
-    description="The classified intent category."
-)
+    intent_type: Literal["qa", "summarization", "calculation", "unknown"] = Field(
+        ...,
+        description="The classified intent category."
+    )
 
-confidence: float = Field(
-    ...,
-    ge=0.0,
-    le=1.0,
-    description="Confidence score between 0 and 1."
-)
+    confidence: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description="Confidence score between 0 and 1."
+    )
 
-reasoning: str = Field(
-    ...,
-    description="Explanation of why this intent was chosen."
-)
+    reasoning: str = Field(
+        ...,
+        description="Explanation of why this intent was chosen."
+    )
 
-@validator("confidence")
-def validate_confidence(cls, v):
-    if not (0.0 <= v <= 1.0):
-        raise ValueError("Confidence must be between 0 and 1.")
-    return v
+    @validator("confidence")
+    def validate_confidence(cls, v):
+        if not (0.0 <= v <= 1.0):
+            raise ValueError("Confidence must be between 0 and 1.")
+        return v
 
 
 

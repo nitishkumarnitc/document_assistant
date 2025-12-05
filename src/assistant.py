@@ -146,7 +146,11 @@ class DocumentAssistant:
             # Update session with new state
             if final_state.get("messages"):
 
-                self.current_session.conversation_history.append(final_state)
+                self.current_session.conversation_history.append({
+                    "action": final_state.get("action",[]),
+                    "intent": final_state.get("intent").dict() if final_state.get("intent") else None,
+                    "summary": final_state.get("conversation_summary", "")
+                })
                 self.current_session.last_updated = datetime.now()
                 if final_state.get("active_documents"):
                     self.current_session.document_context = list(set(

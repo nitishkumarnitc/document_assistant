@@ -1,250 +1,370 @@
-# Document Assistant Project Instructions
+# Document Assistant — Design, Implementation and Examples
 
-Welcome to the Document Assistant project! This project will help you build a sophisticated document processing system using LangChain and LangGraph. You'll create an AI assistant that can answer questions, summarize documents, and perform calculations on financial and healthcare documents.
+## Project summary
 
-## Project Overview
+This assistant processes user requests using a small multi-agent graph (LangGraph + LangChain). It classifies intent, routes the request to the appropriate agent (QA / Summarization / Calculation), uses tools (Document Retriever & Calculator), enforces **structured outputs** using Pydantic schemas, and updates persistent state/memory between turns.
 
-This document assistant uses a multi-agent architecture with LangGraph to handle different types of user requests:
-- **Q&A Agent**: Answers specific questions about document content
-- **Summarization Agent**: Creates summaries and extracts key points from documents
-- **Calculation Agent**: Performs mathematical operations on document data
+Key goals:
 
-### Prerequisites
-- Python 3.10+
-- OpenAI API key
+* Reliable intent routing
+* Typed, machine-parseable responses (structured outputs)
+* Clear state & memory so conversation can be resumed
+* Auditability (tools used, sources, timestamps)
 
-### Installation
+---
 
-1. Clone the repository:
-```bash
-cd <repository_path>
+## Design overview (agent graph)
+
+```
+User Input
+   ↓
+classify_intent  (LLM -> returns UserIntent)
+   ↓ next_step -> "qa_agent" | "summarization_agent" | "calculation_agent"
+qa_agent / summarization_agent / calculation_agent
+   ↓
+update_memory
+   ↓
+END
 ```
 
-2. Create a virtual environment:
-```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+* `classify_intent` is always the entry point. It returns a `UserIntent` (see schema below) and sets `next_step`.
+* Each agent (qa/summarization/calculation) uses structured-output schemas for its response and may call tools:
+
+  * Document Retriever (reads source docs; returns doc ids & snippets)
+  * Calculator (performs numerical computations; used by calculation agent)
+* After an agent completes, `update_memory` summarizes the turn and updates `AgentState`.
+
+---
+
+## Implementation decisions & rationale
+
+1. **Structured outputs** — enforce LLM responses using Pydantic schemas via `llm.with_structured_output(Schema)`.
+
+   * Reason: avoids brittle string parsing; outputs are validated and typed.
+2. **Small, focused agents** — each agent is responsible for one class of tasks (QA, summarization, calculation).
+
+   * Reason: easier prompt tuning, tools mapping and testing.
+3. **Tools as first-class functions** — `@tool` decorated functions (LangChain style) with safe validation.
+
+   * Calculator validates expressions to avoid code injection and only allows basic arithmetic.
+4. **State and persistence** — use an `AgentState` model and `InMemorySaver` checkpointer (or replaceable persistence layer).
+
+   * Reason: Allows resuming conversations and testing state transitions.
+5. **Auditable actions** — state keeps `tools_used`, `actions_taken`, `active_documents`, timestamps for traceability.
+
+---
+
+## Key schemas
+
+### `UserIntent` (intent classification)
+
+```py
+class UserIntent(BaseModel):
+    intent_type: Literal["qa", "summarization", "calculation", "unknown"]
+    confidence: float = Field(ge=0.0, le=1.0)
+    reasoning: str
 ```
 
-3. Install dependencies:
-```bash
-pip install -r requirements.txt
+### `AnswerResponse` (Q&A response)
+
+```py
+class AnswerResponse(BaseModel):
+    question: str
+    answer: str
+    sources: List[str]
+    confidence: float = Field(ge=0.0, le=1.0)
+    timestamp: datetime
 ```
 
-4. Create a `.env` file:
-```bash
-cp .env.example .env
-# Edit .env and add your OpenAI API key
+(You will also have schemas for `SummarizationResponse` and `CalculationResponse` — follow the same pattern: typed fields, `sources`, `confidence`, `timestamp`.)
+
+### `AgentState` (important fields)
+
+```py
+class AgentState(BaseModel):
+    user_input: str
+    messages: List[MessageAnnotation]
+    intent: Optional[UserIntent] = None
+    next_step: Optional[str] = None
+    conversation_summary: Optional[str] = None
+    active_documents: List[str] = []
+    current_response: Optional[Dict] = None   # structured result placed here
+    tools_used: List[str] = []
+    actions_taken: List[str] = []              # reducer: operator.add
+    session_id: str
+    user_id: Optional[str]
 ```
 
-### Running the Assistant
+* `actions_taken` uses an `operator.add` reducer in the workflow to accumulate nodes executed each turn (helps auditing).
+* `current_response` stores the validated structured output of the last executed agent.
 
-```bash
-python main.py
+---
+
+## How structured outputs are enforced (practical notes)
+
+* Use the LLM helper to **wrap** responses with the Pydantic schema:
+
+  ```py
+  llm_structured = llm.with_structured_output(UserIntent)
+  out = llm_structured.generate(prompt)  # library-specific API
+  user_intent: UserIntent = out.value
+  ```
+* If the LLM returns invalid data, the `.with_structured_output()` wrapper will raise/return validation errors; handle them by:
+
+  * re-prompting (fallback)
+  * use default: `intent_type="unknown"`
+* For agent nodes, do the same with `AnswerResponse` / `SummarizationResponse` / `CalculationResponse`.
+
+---
+
+## Prompts & how they map to agents
+
+* `get_intent_classification_prompt()` — used by `classify_intent`. Inputs: `user_input`, `conversation_history`. Output schema: `UserIntent`.
+* `QA_SYSTEM_PROMPT`, `SUMMARIZATION_SYSTEM_PROMPT`, `CALCULATION_SYSTEM_PROMPT` — used in `get_chat_prompt_template(intent_type, ...)` which selects the system context for the agent node.
+
+**Important**: `CALCULATION_SYSTEM_PROMPT` must instruct the model to *always* use the `calculator` tool for arithmetic and to indicate which document(s) it needs.
+
+---
+
+## Tools
+
+### Document Retriever
+
+* API: `retrieve_documents(query) -> List[Document]`
+* Returns document id, title, and local snippet.
+* Populates `active_documents` in state.
+
+### Calculator tool (safe)
+
+* Decorated with `@tool`.
+* Validates input expression using a whitelist regex (digits, spaces, `+ - * / ( ) .`).
+* Uses `eval()` only after validation, inside a restricted namespace.
+* Logs tool use (ToolLogger) and returns a formatted string.
+
+Example (pseudocode):
+
+```py
+@tool("calculator")
+def calculator_tool(expression: str) -> str:
+    if not SAFE_RE.match(expression):
+        return "Invalid expression"
+    result = eval(expression, {"__builtins__": {}})
+    ToolLogger.log("calculator", expression)
+    return f"Result: {result}"
 ```
 
-## Project Structure
+---
+
+## State & memory flow (detailed)
+
+1. **Start**: `process_message` creates or loads `AgentState` for `session_id`.
+2. **classify_intent**:
+
+   * Compose prompt with `user_input` + `messages`.
+   * Call `llm.with_structured_output(UserIntent)` and parse response.
+   * Populate `state.intent`, choose `next_step`:
+
+     * `qa` → `"qa_agent"`
+     * `summarization` → `"summarization_agent"`
+     * `calculation` → `"calculation_agent"`
+     * default → `"qa_agent"`
+   * `actions_taken += ["classify_intent"]`
+3. **Agent Node (qa/summarization/calculation)**:
+
+   * Construct prompt using `get_chat_prompt_template(intent_type, ...)`.
+   * If needed, call `retrieve_documents()` to get sources; add to `state.active_documents` and `tools_used`.
+   * If `calculation_agent`:
+
+     * the LLM must decide the expression and call `calculator` tool; we enforce calculator usage in the system prompt.
+     * record `tools_used += ["calculator"]`.
+   * Receive structured response and set `state.current_response`.
+   * `actions_taken += ["qa_agent"]` (or the relevant agent name).
+4. **update_memory**:
+
+   * Summarize the turn (LLM or local summarizer).
+   * Update `conversation_summary`, `messages`, `active_documents`.
+   * Persist `AgentState` via the chosen checkpointer.
+5. **Persist**: the workflow compiled with `InMemorySaver()` or other saver persists the `AgentState` across invocations.
+
+---
+
+## Session persistence & logging
+
+* **Persistence**:
+
+  * Default: `InMemorySaver()` — useful for tests and demos.
+  * For production, swap the saver for a file/db-backed saver (Redis, DynamoDB, or custom).
+  * Sessions saved under `sessions/` (or configured storage) by `session_id`. Example file: `sessions/<session_id>.json` (if using file saver).
+* **Logging**:
+
+  * Tools log entries via `ToolLogger` with fields: `timestamp`, `tool_name`, `input`, `output`.
+  * Application logs (info/debug) stored in `logs/assistant.log`.
+  * Example log contents:
+
+    ```
+    2025-12-05T10:12:23Z INFO classify_intent session=abc123 prompt=... 
+    2025-12-05T10:12:24Z INFO qa_agent session=abc123 retrieved_docs=['doc_42','doc_9']
+    2025-12-05T10:12:25Z INFO tool:calculator session=abc123 input='10 / 2' output='5.0'
+    ```
+* **How to inspect previous sessions**:
+
+  * Read `sessions/<session_id>.json` or call `assistant.get_session(session_id)` (helper).
+  * Logs are plain text rotated monthly; look in `logs/`.
+
+---
+
+## Example conversations
+
+> NOTE: These examples include the structured outputs the agents produce. Timestamps and session ids are illustrative.
+
+### 1) QA flow (intent: `qa`)
+
+**User**: "In the March financial statement, what is the total operating expense for product line A?"
+
+**Flow**:
+
+1. `classify_intent` → returns:
+
+   ```json
+   {
+     "intent_type":"qa",
+     "confidence":0.92,
+     "reasoning":"User asks a direct fact question about a document (financial statement)."
+   }
+   ```
+2. `qa_agent`:
+
+   * Document retriever called with query "March financial statement product line A operating expense".
+   * Tools used: `doc_retriever` → found `["doc_fin_2025_march"]`
+   * Prompt enforces `AnswerResponse` structured output.
+   * LLM returns `AnswerResponse`:
+
+     ```json
+     {
+       "question":"In the March financial statement, what is the total operating expense for product line A?",
+       "answer":"The total operating expense for product line A in March is $1,238,450.",
+       "sources":["doc_fin_2025_march"],
+       "confidence":0.86,
+       "timestamp":"2025-12-05T10:20:32Z"
+     }
+     ```
+3. `update_memory` summarizes the turn and records `active_documents=["doc_fin_2025_march"]`.
+
+### 2) Summarization flow (intent: `summarization`)
+
+**User**: "Summarize the main risks discussed in the uploaded compliance report."
+
+**Flow**:
+
+* `classify_intent` → `{"intent_type":"summarization", ...}`
+* `summarization_agent`:
+
+  * retriever finds `doc_compliance_v2`.
+  * LLM enforces `SummarizationResponse` schema, returns:
+
+    ```json
+    {
+      "summary":"The report highlights three major risks: 1) Third-party vendor compliance gaps; 2) Data retention policy inconsistencies; 3) Insufficient access controls for exporting data.",
+      "key_points":[
+        "Vendor compliance checks missing in 12% of cases",
+        "Retention policy not unified across subsidiaries",
+        "Export permissions enabled for legacy accounts"
+      ],
+      "sources":["doc_compliance_v2"],
+      "confidence":0.81,
+      "timestamp":"2025-12-05T10:25:01Z"
+    }
+    ```
+* `update_memory` appends the summary to `conversation_summary`.
+
+### 3) Calculation flow (intent: `calculation`)
+
+**User**: "From the spreadsheet, what's the net margin for product B if revenue is 4,200 and costs equal fixed 1200 plus 12% of revenue?"
+
+**Flow**:
+
+* `classify_intent` → `{"intent_type":"calculation", ...}`
+* `calculation_agent`:
+
+  * Document retriever optionally fetches numeric parameters from `doc_spreadsheet_productB`.
+  * System prompt forces: "use the calculator tool for all math".
+  * LLM decides expression: `net_margin = revenue - (fixed_cost + 0.12 * revenue)` → expression `4200 - (1200 + 0.12*4200)`.
+  * Calls `calculator` tool with expression `4200 - (1200 + 0.12*4200)`.
+  * Calculator returns `Result: 4200 - (1200 + 504) = 2496`.
+  * `CalculationResponse`:
+
+    ```json
+    {
+      "formula":"net_margin = revenue - (fixed_cost + 0.12 * revenue)",
+      "expression":"4200 - (1200 + 0.12*4200)",
+      "result":2496,
+      "sources":["doc_spreadsheet_productB"],
+      "confidence":0.9,
+      "timestamp":"2025-12-05T10:30:10Z"
+    }
+    ```
+* `update_memory` stores the numeric result and the fact that `calculator` was used.
+
+---
+
+## Example code snippets
+
+### classify_intent (illustrative)
+
+```py
+def classify_intent(state: AgentState, config) -> AgentState:
+    llm = config.llm
+    # wrap with schema enforcement
+    llm_struct = llm.with_structured_output(UserIntent)
+
+    prompt = get_intent_classification_prompt().format(
+        user_input=state.user_input,
+        conversation_history="\n".join([m.text for m in state.messages])
+    )
+
+    response = llm_struct.generate(prompt)
+    intent: UserIntent = response.value
+
+    state.intent = intent
+    state.actions_taken = state.actions_taken + ["classify_intent"]
+    state.next_step = {
+        "qa":"qa_agent",
+        "summarization":"summarization_agent",
+        "calculation":"calculation_agent"
+    }.get(intent.intent_type, "qa_agent")
+    return state
 ```
-doc_assistant_project/
-├── src/
-│   ├── schemas.py        # Pydantic models
-│   ├── retrieval.py      # Document retrieval
-│   ├── tools.py          # Agent tools
-│   ├── prompts.py        # Prompt templates
-│   ├── agent.py          # LangGraph workflow
-│   └── assistant.py      # Main agent
-├── sessions/             # Saved conversation sessions
-├── main.py               # Entry point
-├── requirements.txt      # Dependencies
-└── README.md             # This file
+
+### Using the calculator tool (illustrative)
+
+```py
+@tool("calculator")
+def calculator_tool(expression: str) -> str:
+    # allow only digits, whitespace, parentheses, ., and + - * /
+    if not re.fullmatch(r"[0-9\.\s\+\-\*\/\(\)]+", expression):
+        raise ValueError("Unsafe expression")
+    result = eval(expression, {"__builtins__": {}})
+    ToolLogger.log(tool="calculator", input=expression, output=str(result))
+    return f"Result: {result}"
 ```
 
+---
 
+## Testing & example scripts
 
-## Agent Architecture
+* **Integration**:
 
-The LangGraph agent follows this workflow:
+  * Run `python main.py` and try the three examples above. Inspect `sessions/<session_id>.json` to verify `actions_taken`, `current_response`, `conversation_summary`, and `active_documents`.
+* **Manual checks**:
 
-![](./docs/langgraph_agent_architecture.png)
+  * Inspect `logs/assistant.log` and `logs/tools.log` for full traceability.
 
-## Implementation Tasks
+---
 
-### 1. Schema Implementation (schemas.py)
+## Deployment & config notes
 
-#### Task 1.1: AnswerResponse Schema
-Create a Pydantic model for structured Q&A responses with the following fields:
-- `question`: The original user question (string)
-- `answer`: The generated answer (string)
-- `sources`: List of source document IDs used (list of strings)
-- `confidence`: Confidence score between 0 and 1 (float)
-- `timestamp`: When the response was generated (datetime)
+* `.env` must contain `OPENAI_API_KEY` (or the appropriate LLM provider credentials).
+* Replace `InMemorySaver` with a persistent saver for production (Redis or DB).
+* Consider rate-limiting or batching prompts for cost control.
+* For production, add stricter input sanitation (especially for any user input passed into `eval()`-like constructs).
 
-**Purpose**: This schema ensures consistent formatting of answers and tracks which documents were referenced.
-
-#### Task 1.2: UserIntent Schema
-Create a Pydantic model for intent classification with these fields:
-- `intent_type`: The classified intent ("qa", "summarization", "calculation", or "unknown")
-- `confidence`: Confidence in classification (float between 0 and 1)
-- `reasoning`: Explanation for the classification (string)
-
-**Purpose**: This schema helps the system understand what type of request the user is making and route it to the appropriate agent.
-
-### 2. Agent State Implementation (agent.py, assistant.py)
-
-#### Task 2.1: AgentState Properties
-The `AgentState` class is already defined, but you need to understand its structure:
-- `user_input`: Current user input
-- `messages`: Conversation messages with LangGraph message annotation
-- `intent`: Classified user intent
-- `next_step`: Next node to execute in the graph
-- `conversation_summary`: Summary of recent conversation
-- `active_documents`: Document IDs currently being discussed
-- `current_response`: The response being built
-- `tools_used`: List of tools used in current turn
-- `session_id` and `user_id`: Session management
-- `actions_taken`: List of agent nodes executed (to be added in Task 2.6)
-
-#### Task 2.2: Intent Classification Function
-Implement the `classify_intent` function:
-The `classify_intent` function is the first node in the graph. It just purpose to query the LLM, by providing both the user's input
-and message history (if any exists) and instruct the LLM to classify the intent so that graph can direct the request to the appropriate node.
-Some of the code for this function is already provided, but you need to complete it by doing the following steps:
-1. Configure the `llm` to use structured output with the `UserIntent` schema
-2. Create a prompt by calling the `get_intent_classification_prompt()` function from `prompts.py`.(HINT: you will need to call `format` on the returned value and pass in the `user_input` and `conversation_history`) 
-3. Make sure you read the prompt on `prompts.py` to understand what input variables it expects and what it is asking the LLM to return.
-4. Invoke the LLM with the prompt
-5. Implement conditional logic that sets the `next_step` based on the classified `intent`:
-   - "qa" --> "qa_agent"
-   - "summarization" --> "summarization_agent"
-   - "calculation" --> "calculation_agent"
-   - default --> "qa_agent"
-6. Update the state with `actions_taken = ["classify_intent"]` also include the new `intent` value and `next_step`, then return the updated state
-
-**Key concepts**: 
-- Use `llm.with_structured_output(UserIntent)` for structured responses
-- The function should return a state update with `actions_taken`, `intent`, and `next_step`
-
-#### Task 2.3: Calculation Agent Completion & Summarization Agent Completion
-Take a look at the code for the `qa_agent` node in `agent.py`. Pay attention to the parameters it takes, how it retrieves and constructs the prompt, and how it enforces structured output and how it updates the state object. 
-1. Implement the `calculation_agent` and `summarization_agent` functions to follow the same pattern by some function calls must be modified to accept values that are specific to the respective nodes.
-2. Be sure to use properly retrieve the prompt templates
-3. Take a look at the defined structured output schemas that correspond to each node and pass them to the appropriate function.
-4. Make sure to return an updated state object that includes all the same fields that are updated by the `qa_agent` node.
-
-
-#### Task 2.4: Complete the Update Memory Function
-Complete the `update_memory` function by doing the following steps:
-1. Extract the llm from the config parameter. (HINT: you may need to modify the function in order to do this)
-2. Pass in the correct schema to enforce structured output
-3. Updates the state with conversation_summary, active_documents, and next_step
-
-
-**Purpose**: This function maintains conversation context and tracks document references across turns.
-
-#### Task 2.5: Workflow Creation
-Complete the `create_workflow` function that:
-1. Adds all agent nodes (classify_intent, qa_agent, summarization_agent, calculation_agent, update_memory)
-2. In the `add_conditional_edges` method map each intent type to the corresponding agent node
-3. Adds edges from each agent to update_memory
-4. Fix the returned value so that is compiled with a checkpointer (see Task 2.6)
-
-**Graph Structure**:
-```
-classify_intent --> [qa_agent|summarization_agent|calculation_agent] --> update_memory --> END
-```
-
-#### Task 2.6: State and Memory Persistence
-
-To practice using state reducers and persistent memory, extend `AgentState` and your workflow as follows:
-
-1. Add `operator.add` reducer to the `actions_taken` field of the `AgentState` schema. It will accumulate the names of each agent node that runs during a turn. For example:
-2. (From Task 2.5) Import and use the InMemorySaver from the correct langgraph package and compile the workflow with a checkpointer using `InMemorySaver`. 
-3. A checkpointer persists state across invocations, so your assistant will remember prior state even if you invoke the workflow multiple times. 
-4. Modify `create_workflow` to call `workflow.compile(checkpointer=InMemorySaver())`. You will need to import `InMemorySaver`.
-3. In the `process_message` method in `assistant.py`, you must properly set the values of the `configurable` value within the `config` object. Specifically, you must set:
-   - The `thread_id` to the current_sessions.session_id
-   - The `llm` to the configured LLM instance
-   - The `tools`
-
-These additions will enable you to track the flow of the agent and experiment with persistent state. Refer back to the state management and memory demo exercises for examples.
-
-### 3. Prompt Implementation (prompts.py)
-
-#### Task 3.1: Chat Prompt Template
-Complete the `get_chat_prompt_template` function in `prompts.py`:
-1. Finishing implement the function so that it supports ALL the `intent_type` parameters which could be "qa", "summarization", or "calculation"
-2. Review prompts.py so you are aware of all the prompts in the file then make sure the `get_chat_prompt_template` the function sets the system_prompt to the correct value based on the `intent_type` parameter.
-> Make sure to use existing prompts already defined in the file (QA_SYSTEM_PROMPT, SUMMARIZATION_SYSTEM_PROMPT, CALCULATION_SYSTEM_PROMPT)
-
-**Purpose**: This provides context-aware prompts for different types of tasks.
-
-
-#### Task 3.2: Implement the CalculationSystemPrompt
-Implement the `CALCULATION_SYSTEM_PROMPT` constant in `prompts.py`:
-1. Write a system prompt for the calculation agent that instructs the LLM to:
-- Determine the document that must be retrieved and retrieve it using the document reader tool
-- Determine the mathematical expression to calculate based on the user's input
-- Use the calculator tool to perform the calculation
-2. Make sure the LLM uses the calculator tool for ALL calculations no matter how simple
-
-### 4. Tool Implementation (tools.py)
-
-#### Task 4.1: Calculator Tool
-Implement the `create_calculator_tool` function that:
-1. Uses the `@tool` decorator to create a LangChain tool
-2. Takes a mathematical expression as input
-3. Validates the expression for safety (only allow basic math operations)
-4. Evaluates the expression using Python's `eval()` function
-5. Logs the tool usage with the ToolLogger
-6. Returns a formatted result string
-7. Handles errors gracefully
-
-## Key Concepts for Success
-
-### 1. LangChain Tool Pattern
-Tools are functions decorated with `@tool` that can be called by LLMs. They must:
-- Have clear docstrings describing their purpose and parameters
-- Handle errors gracefully
-- Return string results
-- Log their usage for debugging
-
-### 2. LangGraph State Management
-The state flows through nodes and gets updated at each step. Key principles:
-- Always return the updated state from node functions
-- Use the state to pass information between nodes
-- The state persists conversation context and intermediate results
-
-### 3. Structured Output
-Use `llm.with_structured_output(YourSchema)` to get reliable, typed responses from LLMs instead of parsing strings.
-
-### 4. Conversation Memory
-The system maintains conversation via the InMemorySaver checkpointer:
-- Storing conversation messages with metadata
-- Tracking active documents
-- Summarizing conversations
-- Providing context to subsequent requests
-
-## Testing Your Implementation
-
-1. **Unit Testing**: Test individual functions with sample inputs
-2. **Integration Testing**: Test the complete workflow with various user inputs
-3. **Edge Cases**: Test error handling and edge cases
-
-## Common Pitfalls to Avoid
-
-1. **Missing Error Handling**: Always wrap external calls in try-catch blocks
-2. **Incorrect State Updates**: Ensure you're updating and returning the state correctly
-3. **Prompt Engineering**: Make sure your prompts are clear and specific
-4. **Tool Security**: Validate all inputs to prevent security issues
-
-## Expected Behavior
-
-After implementation, your assistant should be able to:
-- Classify user intents correctly
-- Search and retrieve relevant documents
-- Answer questions with proper source citations
-- Generate comprehensive summaries
-- Perform calculations on document data
-- Maintain conversation context across turns
-
-Good luck with your implementation! Remember to test thoroughly and refer to the existing working code for guidance on patterns and best practices.
